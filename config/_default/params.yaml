@@ -183,7 +183,7 @@ allowedRegions:
     weight: 20
     domain: datadoghq.eu
     exact_domains:
-       "beige.oncall.datadoghq.eu"
+      - "beige.oncall.datadoghq.eu"
       - "browser-intake-datadoghq.eu"
   - name: AP1
     value: ap1
