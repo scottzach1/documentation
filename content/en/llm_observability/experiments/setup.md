@@ -381,7 +381,200 @@ jobs:
           DD_APP_KEY: ${{ secrets.DD_APP_KEY }}
 ```
 
+## Using experiments with OpenTelemetry {#opentelemetry}
+
+If your LLM application is instrumented with OpenTelemetry, you can participate in Experiments without using the Datadog Python SDK. The general approach is:
+
+1. Use the [Experiments API][5] to create your project, dataset, and experiment record — this gives you an `experiment_id` to reference in your traces.
+2. Instrument your task code with OpenTelemetry, attaching the experiment context as span attributes.
+
+The Datadog LLM Observability backend recognizes these attributes and links the resulting spans to your experiment automatically.
+
+### Prerequisites
+
+- An application instrumented with OpenTelemetry configured to send traces to Datadog. See [OpenTelemetry Instrumentation][6] for setup instructions.
+- A [Datadog API key][7] and [application key][8].
+
+### Step 1: Create your experiment via the API
+
+Use the Experiments API to create a project, dataset, and experiment. Save the returned `experiment_id` — you will need it when emitting traces.
+
+```python
+import requests
+
+DD_API_KEY = "<YOUR_DATADOG_API_KEY>"
+DD_APP_KEY = "<YOUR_DATADOG_APP_KEY>"
+DD_SITE = "datadoghq.com"
+
+BASE_URL = f"https://api.{DD_SITE}"
+HEADERS = {
+    "DD-API-KEY": DD_API_KEY,
+    "DD-APPLICATION-KEY": DD_APP_KEY,
+    "Content-Type": "application/json",
+}
+
+# Create a project (returns existing project if name already exists)
+project_resp = requests.post(
+    f"{BASE_URL}/api/v2/llm-obs/v1/projects",
+    headers=HEADERS,
+    json={"data": {"type": "projects", "attributes": {"name": "my-project"}}},
+)
+project_id = project_resp.json()["data"]["id"]
+
+# Create a dataset
+dataset_resp = requests.post(
+    f"{BASE_URL}/api/v2/llm-obs/v1/{project_id}/datasets",
+    headers=HEADERS,
+    json={"data": {"type": "datasets", "attributes": {"name": "capitals-dataset"}}},
+)
+dataset_id = dataset_resp.json()["data"]["id"]
+
+# Add records to the dataset
+requests.post(
+    f"{BASE_URL}/api/v2/llm-obs/v1/{project_id}/datasets/{dataset_id}/records",
+    headers=HEADERS,
+    json={
+        "data": {
+            "type": "datasets",
+            "attributes": {
+                "records": [
+                    {
+                        "input": {"question": "What is the capital of Japan?"},
+                        "expected_output": "Tokyo",
+                    },
+                    {
+                        "input": {"question": "What is the capital of Brazil?"},
+                        "expected_output": "Brasília",
+                    },
+                ]
+            },
+        }
+    },
+)
+
+# Create an experiment (returns existing experiment if name already exists)
+experiment_resp = requests.post(
+    f"{BASE_URL}/api/v2/llm-obs/v1/experiments",
+    headers=HEADERS,
+    json={
+        "data": {
+            "type": "experiments",
+            "attributes": {
+                "name": "capital-cities-otel-test",
+                "project_id": project_id,
+                "dataset_id": dataset_id,
+            },
+        }
+    },
+)
+experiment_id = experiment_resp.json()["data"]["id"]
+experiment_name = experiment_resp.json()["data"]["attributes"]["name"]
+```
+
+### Step 2: Emit experiment spans with OpenTelemetry
+
+For each dataset record your task processes, emit an OpenTelemetry span with `gen_ai.operation.name` set to `"experiment"` and a `_dd.ml_obs.experiments` attribute containing the experiment context as a JSON string.
+
+| Attribute | Required | Description |
+|---|---|---|
+| `gen_ai.operation.name` | Yes | Must be `"experiment"` to mark the span as an experiment span. |
+| `_dd.ml_obs.experiments` | Yes | JSON object containing experiment context. See fields below. |
+
+**`_dd.ml_obs.experiments` fields:**
+
+| Field | Required | Description |
+|---|---|---|
+| `experiment_id` | Yes | UUID returned from the `POST /api/v2/llm-obs/v1/experiments` call. |
+| `experiment_name` | Yes | Name of the experiment. |
+| `project_name` | Yes | Name of the project. |
+| `run_id` | No | UUID identifying this run. Required alongside `run_iteration` for run-level grouping. |
+| `run_iteration` | No | Integer (starting at 1) identifying which iteration of the run this record belongs to. Required alongside `run_id`. |
+| `dataset_name` | No | Name of the dataset. |
+| `project_id` | No | UUID of the project. |
+
+```python
+import json
+import uuid
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource, SERVICE_NAME
+
+# Configure OpenTelemetry to send traces to Datadog LLM Observability
+resource = Resource(attributes={SERVICE_NAME: "my-project"})
+provider = TracerProvider(resource=resource)
+provider.add_span_processor(
+    BatchSpanProcessor(
+        OTLPSpanExporter(
+            endpoint="{{< region-param key="otlp_trace_endpoint" code="true" >}}",
+            headers={
+                "dd-api-key": DD_API_KEY,
+                "dd-otlp-source": "llmobs",
+            },
+        )
+    )
+)
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer(__name__)
+
+# Fetch the dataset records you want to run your task against
+records = [
+    {"input": {"question": "What is the capital of Japan?"}, "expected_output": "Tokyo"},
+    {"input": {"question": "What is the capital of Brazil?"}, "expected_output": "Brasília"},
+]
+
+# A single run_id groups all records in this execution together
+run_id = str(uuid.uuid4())
+
+def task(input_data):
+    question = input_data["question"]
+    # Your LLM or processing logic here
+    return "Tokyo" if "Japan" in question else "Unknown"
+
+for i, record in enumerate(records, start=1):
+    with tracer.start_as_current_span("my_task") as span:
+        # Mark as an experiment span
+        span.set_attribute("gen_ai.operation.name", "experiment")
+
+        # Attach experiment context
+        span.set_attribute(
+            "_dd.ml_obs.experiments",
+            json.dumps({
+                "experiment_id": experiment_id,
+                "experiment_name": experiment_name,
+                "project_name": "my-project",
+                "run_id": run_id,
+                "run_iteration": i,
+                "dataset_name": "capitals-dataset",
+                "project_id": project_id,
+            }),
+        )
+
+        # Run the task and capture input/output
+        output = task(record["input"])
+
+        span.set_attribute(
+            "gen_ai.input.messages",
+            json.dumps([{"role": "user", "content": record["input"]["question"]}]),
+        )
+        span.set_attribute(
+            "gen_ai.output.messages",
+            json.dumps([{"role": "assistant", "content": output}]),
+        )
+
+# Flush all spans before the process exits
+provider.force_flush()
+```
+
+After running this example, navigate to the [LLM Observability Experiments page][9] to view your experiment results.
+
 [1]: /llm_observability/experiments/datasets
 [2]: /llm_observability/instrumentation/custom_instrumentation?tab=decorators#trace-an-llm-application
 [3]: /llm_observability/instrumentation/auto_instrumentation?tab=python
 [4]: /llm_observability/guide/evaluation_developer_guide
+[5]: /llm_observability/experiments/api
+[6]: /llm_observability/instrumentation/otel_instrumentation
+[7]: https://app.datadoghq.com/organization-settings/api-keys
+[8]: https://app.datadoghq.com/organization-settings/application-keys
+[9]: https://app.datadoghq.com/llm/experiments
