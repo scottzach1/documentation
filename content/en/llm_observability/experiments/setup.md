@@ -473,7 +473,7 @@ experiment_name = experiment_resp.json()["data"]["attributes"]["name"]
 
 ### Step 2: Emit experiment spans with OpenTelemetry
 
-For each dataset record your task processes, emit an OpenTelemetry span with `gen_ai.operation.name` set to `"experiment"` and a `_dd.ml_obs.experiments` attribute containing the experiment context as a JSON string.
+For each dataset record your task processes, emit an OpenTelemetry span with `gen_ai.operation.name` set to `"experiment"` and a `_dd.ml_obs.experiments` attribute containing the experiment context as a JSON string. Set `gen_ai.input.messages` and `gen_ai.output.messages` on this root experiment span to capture the initial input and final output of your task.
 
 | Attribute | Required | Description |
 |---|---|---|
@@ -551,13 +551,16 @@ for i, record in enumerate(records, start=1):
             }),
         )
 
-        # Run the task and capture input/output
-        output = task(record["input"])
-
+        # Set input before running the task — always on the root span,
+        # even if your task creates child spans internally
         span.set_attribute(
             "gen_ai.input.messages",
             json.dumps([{"role": "user", "content": record["input"]["question"]}]),
         )
+
+        output = task(record["input"])
+
+        # Set output on the root span after the task completes
         span.set_attribute(
             "gen_ai.output.messages",
             json.dumps([{"role": "assistant", "content": output}]),
